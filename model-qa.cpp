@@ -56,25 +56,25 @@ class SimpleTokenizer {
 public:
     SimpleTokenizer(const std::string& model_path) {
         // Load special tokens map
-        std::ifstream special_tokens_file(model_path + "/special_tokens_map.json");
+        std::ifstream special_tokens_file(fs::path(model_path) / "special_tokens_map.json");
         if (!special_tokens_file.is_open()) {
-            throw std::runtime_error("Failed to open special_tokens_map.json in " + model_path);
+            throw std::runtime_error("Failed to open special_tokens_map.json");
         }
         json special_tokens_json;
         special_tokens_file >> special_tokens_json;
         
         // Load tokenizer config
-        std::ifstream tokenizer_config_file(model_path + "/tokenizer_config.json");
+        std::ifstream tokenizer_config_file(fs::path(model_path) / "tokenizer_config.json");
         if (!tokenizer_config_file.is_open()) {
-            throw std::runtime_error("Failed to open tokenizer_config.json in " + model_path);
+            throw std::runtime_error("Failed to open tokenizer_config.json");
         }
         json tokenizer_config_json;
         tokenizer_config_file >> tokenizer_config_json;
         
         // Load vocabulary
-        std::ifstream vocab_file(model_path + "/tokenizer.json");
+        std::ifstream vocab_file(fs::path(model_path) / "tokenizer.json");
         if (!vocab_file.is_open()) {
-            throw std::runtime_error("Failed to open tokenizer.json in " + model_path);
+            throw std::runtime_error("Failed to open tokenizer.json");
         }
         json vocab_json;
         vocab_file >> vocab_json;
@@ -229,6 +229,12 @@ Ort::Session create_session(const std::string& model_path) {
     Ort::SessionOptions session_options;
     session_options.SetIntraOpNumThreads(1);
     session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    
+    // Set memory arena settings
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
+        OrtArenaAllocator,
+        OrtMemTypeDefault
+    );
     
     // Create environment
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "model-qa");
@@ -455,11 +461,45 @@ std::vector<int> generate_text(
             if (!kv_cache.empty()) {
                 std::cout << "Adding " << kv_cache.size() << " KV cache tensors..." << std::endl;
                 
-                // Move KV cache tensors to input tensors
-                for (auto& tensor : kv_cache) {
-                    input_tensors.push_back(std::move(tensor));
+                // Create a copy of KV cache tensors
+                std::vector<Ort::Value> kv_cache_copy;
+                kv_cache_copy.reserve(kv_cache.size());
+                
+                for (size_t j = 0; j < kv_cache.size(); ++j) {
+                    auto tensor_info = kv_cache[j].GetTensorTypeAndShapeInfo();
+                    auto shape = tensor_info.GetShape();
+                    
+                    // Update sequence length in shape if needed
+                    if (shape.size() >= 3) {
+                        shape[2] = current_seq_length;
+                    }
+                    
+                    // Calculate new tensor size
+                    size_t tensor_size = 1;
+                    for (size_t k = 0; k < shape.size(); ++k) {
+                        tensor_size *= static_cast<size_t>(shape[k]);
+                    }
+                    
+                    // Get data pointer from original tensor
+                    float* data_ptr = kv_cache[j].GetTensorMutableData<float>();
+                    
+                    // Create a new tensor with the same data
+                    auto new_tensor = Ort::Value::CreateTensor<float>(
+                        memory_info,
+                        data_ptr,
+                        tensor_size,
+                        shape.data(),
+                        shape.size()
+                    );
+                    kv_cache_copy.push_back(std::move(new_tensor));
                 }
-                kv_cache.clear();
+                
+                // Add KV cache tensors to input tensors
+                input_tensors.insert(
+                    input_tensors.end(),
+                    std::make_move_iterator(kv_cache_copy.begin()),
+                    std::make_move_iterator(kv_cache_copy.end())
+                );
             }
             
             // Run inference with error handling
@@ -584,7 +624,10 @@ std::vector<int> generate_text(
                 // Update KV cache with new outputs
                 if (output_tensors.size() > 1) {
                     std::cout << "Updating KV cache..." << std::endl;
-                    kv_cache.reserve(output_tensors.size() - 1);
+                    
+                    // Create a new vector for the updated KV cache
+                    std::vector<Ort::Value> new_kv_cache;
+                    new_kv_cache.reserve(output_tensors.size() - 1);
                     
                     // Each layer has a key and value tensor in the output
                     for (size_t j = 1; j < output_tensors.size(); j += 2) {
@@ -631,10 +674,12 @@ std::vector<int> generate_text(
                         );
                         
                         // Add to new KV cache
-                        kv_cache.push_back(std::move(new_key));
-                        kv_cache.push_back(std::move(new_value));
+                        new_kv_cache.push_back(std::move(new_key));
+                        new_kv_cache.push_back(std::move(new_value));
                     }
                     
+                    // Replace old KV cache with new one
+                    kv_cache = std::move(new_kv_cache);
                     std::cout << "KV cache updated with " << kv_cache.size() << " tensors" << std::endl;
                 }
             } catch (const Ort::Exception& e) {
@@ -683,19 +728,15 @@ int main(int argc, char* argv[]) {
         float repetition_penalty = result["repetition_penalty"].as<float>();
         
         // Load model configuration
-        std::cout << "Loading model configuration..." << std::endl;
         ModelConfig config = load_config(model_path);
         
         // Create ONNX session
-        std::cout << "Creating ONNX session..." << std::endl;
         Ort::Session session = create_session(model_path);
         
         // Initialize tokenizer with the correct path
-        std::cout << "Initializing tokenizer..." << std::endl;
         SimpleTokenizer tokenizer(model_path);
         
         // Generate text
-        std::cout << "Generating text..." << std::endl;
         std::vector<int> output_tokens = generate_text(
             session,
             tokenizer,
@@ -709,7 +750,6 @@ int main(int argc, char* argv[]) {
         
         // Decode and print output
         std::string output = tokenizer.decode(output_tokens);
-        std::cout << "\nGenerated text:" << std::endl;
         std::cout << output << std::endl;
         
         return 0;
